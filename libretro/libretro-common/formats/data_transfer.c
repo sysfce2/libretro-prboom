@@ -596,6 +596,46 @@ bool data_transfer_window_extend(data_transfer_t *dt, size_t hi)
    return true;
 }
 
+bool data_transfer_window_ensure(data_transfer_t *dt, size_t lo,
+      size_t hi)
+{
+   if (!dt || !dt->window || dt->failed)
+      return false;
+   if (hi > dt->len)
+      hi = dt->len;
+   if (lo >= hi)
+      return true;
+   if (!dt->map_len)
+      return true;               /* fallback: whole file resident */
+   if (!data_transfer_wcommit(dt, lo, hi))
+   {
+      data_transfer_wfail(dt);
+      return false;
+   }
+   if (!data_transfer_read_at(dt, lo, dt->map + lo, hi - lo))
+   {
+      data_transfer_wfail(dt);
+      return false;
+   }
+   return true;
+}
+
+void data_transfer_window_rebase(data_transfer_t *dt, size_t pos)
+{
+   size_t p;
+   if (!dt || !dt->window || !dt->map_len || dt->failed)
+      return;
+   if (pos > dt->len)
+      pos = dt->len;
+   p = (pos / dt->page) * dt->page;
+   if (p <= dt->whi)
+      return;                    /* frontier already covers it */
+   dt->wlo    = p;
+   dt->whi    = p;
+   dt->wfreed = p;
+   return;
+}
+
 void data_transfer_window_advance(data_transfer_t *dt, size_t lo)
 {
    if (!dt || !dt->window || !dt->map_len || dt->failed)
@@ -701,9 +741,14 @@ void data_transfer_window_punch(data_transfer_t *dt, size_t from,
 #endif
 }
 
-bool data_transfer_window_feed(data_transfer_t *dt, size_t tell,
-      size_t lookahead, size_t margin)
+bool data_transfer_window_feed_budget(data_transfer_t *dt, size_t tell,
+      size_t lookahead, size_t margin, size_t budget,
+      size_t *resident_hi)
 {
+   bool ok;
+   size_t hi;
+   if (resident_hi)
+      *resident_hi = 0;
    if (!dt || !dt->window || dt->failed)
       return false;
    if (tell < dt->wtell)
@@ -711,7 +756,31 @@ bool data_transfer_window_feed(data_transfer_t *dt, size_t tell,
    dt->wtell = tell;
    if (tell > margin && tell - margin > dt->wlo)
       data_transfer_window_advance(dt, tell - margin);
-   return data_transfer_window_extend(dt, tell + lookahead);
+   hi = tell + lookahead;
+   /* The ceiling applies only while the frontier covers the consumer.
+    * A frontier behind tell means the consumer's next read lands on
+    * unresident pages, and pacing THAT read over ticks is not a
+    * smaller burst, it is a fault: close the gap in one extend, as
+    * the unbudgeted feed always has. */
+   if (budget && dt->whi >= tell)
+   {
+      size_t cap = dt->whi + budget;
+      if (cap < dt->whi)                 /* wrapped: no ceiling */
+         cap = (size_t)-1;
+      if (hi > cap)
+         hi = cap;
+   }
+   ok = data_transfer_window_extend(dt, hi);
+   if (resident_hi)
+      *resident_hi = dt->map_len ? dt->whi : dt->len;
+   return ok;
+}
+
+bool data_transfer_window_feed(data_transfer_t *dt, size_t tell,
+      size_t lookahead, size_t margin)
+{
+   return data_transfer_window_feed_budget(dt, tell, lookahead,
+         margin, 0, NULL);
 }
 
 static data_transfer_t *data_transfer_open_prefix_ex(const char *path,
